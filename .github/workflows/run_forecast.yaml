@@ -8,7 +8,7 @@ on:
 jobs:
   run_forecast:
     runs-on: ubuntu-latest
-      container:
+    container:
       image: eco4cast/rocker-neon4cast
     steps:
       - name: Checkout repo
