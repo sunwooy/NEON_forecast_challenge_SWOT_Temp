@@ -1,3 +1,5 @@
+install.packages(tidymodels, doParallel, ranger, readr, httr, jsonlite)
+
 library(tidyverse)
 library(lubridate)
 library(slider)
