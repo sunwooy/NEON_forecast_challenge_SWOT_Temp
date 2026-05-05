@@ -1,4 +1,4 @@
-install.packages(tidymodels, doParallel, ranger, readr, httr, jsonlite)
+install.packages(c("tidymodels", "doParallel", "ranger", "readr", "httr", "jsonlite"))
 
 library(tidyverse)
 library(lubridate)
