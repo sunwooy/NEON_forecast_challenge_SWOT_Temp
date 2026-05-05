@@ -14,8 +14,7 @@ library(jsonlite)
 
 
 # It's a random forest model that uses air temperature, a 3-day mean air temperature, and SWOT_WSE temperature as predictor for water temperature. 
-# my_model_id <- 'SWOT_AirTemp_RF'
-my_model_id <- 'Example'
+my_model_id <- 'SWOT_AirTemp_RF'
 
 
 targets <- read_csv("https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz")
