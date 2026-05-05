@@ -1,4 +1,3 @@
-```
 on:
   workflow_dispatch:
   schedule:
@@ -21,4 +20,3 @@ jobs:
       - name: Run automatic forecast submission
         run: Rscript Submit_forecast/Forecast.R
         
-```
