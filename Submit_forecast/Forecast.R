@@ -644,6 +644,7 @@ date <- forecast_df_EFI$reference_datetime[1]
 forecast_name <- paste0(forecast_df_EFI$model_id[1], ".csv")
 forecast_file <- paste(theme, date, forecast_name, sep = '-')
 
+write_csv(forecast_df_EFI, forecast_file)
 
 neon4cast::forecast_output_validator(forecast_file)
 
