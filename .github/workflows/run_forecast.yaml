@@ -1,7 +1,7 @@
 on:
   workflow_dispatch:
   schedule:
-  - cron: "0 13 * * *"
+  - cron: "30 14 * * *"
 
 jobs:
   run_forecast:
@@ -10,7 +10,7 @@ jobs:
       image: eco4cast/rocker-neon4cast
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v2
         with:
           fetch-depth: 0
 
