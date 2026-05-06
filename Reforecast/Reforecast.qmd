@@ -1,0 +1,984 @@
+---
+title: "Reforecast"
+format: html
+editor: visual
+---
+
+### **PART 1.**
+
+I am forecasting surface water temperature for the NEON forecast challenge. We forecast daily water temperature for all lakes in the NEON forecast challenge except Lake Toolik in Alaska because the lake is ice covered for most of the year. The model is a random forest that uses air temperature and 3-day lag air temperature from NOAA, and water surface elevation (WSE) anomaly from the Surface Water and Ocean Topography (SWOT) mission. No other model in the catalog includes water level and certainly not from an external **satellite**. These variables were selected to reflect main controls of lake surface water temperature, specifically solar radiation and atmospheric exchange with air temperature and outflow/inflow, stratification timing, and heat interia generally reflected as WSE. SWOT's WSE was transformed to WSE anomalies by taking deviations from mean WSE from 2023-2024 for each lake. This was done because SWOT's WSE is relative to a datum and a global random forest model would likely learn site-specific elevation relationships with raw WSE rather than a volume-temperature relationship. It is worth noting that while water temperature exhibits lag properties (eg yesterday's water temperature is likely similar to today's water temperature), I did not decide to include a water lag because I suspect such variable would dominate model importance and muddle understanding of the relationship between water temperature and volume, but also because I would be interested to see how such framework can be expanded to more lakes globally where consistent water temperature data might not be available.
+
+Random forest models were tuned for possible SWOT observation lag (time between forecast initiation and earliest available satellite observation). While in-situ temperature measurements are daily, SWOT has a temporal resolution of around 21 days and a latency of around 2 days. This means we can only forecast temperature with water elevation levels from 2 days ago at best. To reflect the temporal mismatch, 60 random forest model is trained for possible SWOT observation lag. Because we have limited training data, we expanded the data by expanding temperature observation 60 days for each SWOT observation, regardless of whether there were another SWOT observation during that time period. In other words, each SWOT observation was paired with 60 days of future water temperature and air temperature observations to simulate a scenario where past SWOT observation must be pulled when making a forecast.
+
+Models were trained from dates following the SWOT science orbit starting July 2023. For future forecasts, the model was trained on data from 2023-present. For the reforecasts, the model was trained on data from 2023, 2025, and 2026, then reforcasted starting 2024. Although this isn't a true reforecast since there might be some temperature projection from 2024-2025, I made this decision for the project to capture unique low water levels observed over SUGG and BARC in 2025 that wasn't reflected in the other years. Each model was trained on all the lakes rather than for each specific lake to accomodate limited training data and to understand general relationships between water quantity and air temperature with water temperature. The models were not updated with each new temperature observation due to the sheer number of random forest models that must be tuned iteratively. Hyperparameter tuning with a random grid search on a 5 fold split were conducted for each model. Tuned parameters include the number of randomly selected predictor variables (Mtry), the minimum number of data points required in a node for it to be split (Min_n), and the number of trees.
+
+Two types of uncertainties were included in the forecast. Driver uncertainty from air temperature forecasts were included by inclusion of 310 ensemble members. Process uncertainty were included with the standard deviation of the residuals for each random forest mode. Initial uncertainty and parameter uncertainty were not included in the model because we did not have a lag water temperature and parameter uncertainty is not needed for a machine learning model such as a random forest model.
+
+### **PART 2.** 
+
+```{r}
+
+library(tidyverse)
+library(lubridate)
+library(slider)
+library(dplyr)
+library(tidyr)
+library(slider)
+library(tibble)
+library(scoringRules)
+library(duckdbfs)
+library(tidymodels)
+library(doParallel)
+library(vip)
+library(fastshap)
+library(yardstick)
+library(ggplot2)
+library(shapviz)
+library(purrr)
+library(ranger)
+library(readr)
+library(httr)
+library(jsonlite)
+
+
+
+
+# Identify NEON sites to forecast
+aquatic_sites <- read_csv("https://raw.githubusercontent.com/eco4cast/neon4cast-ci/refs/heads/main/neon4cast_field_site_metadata.csv") |>
+  dplyr::filter(aquatics == 1)
+
+# We filter out TOOK lake because it's mostly frozen all year round
+focal_sites <- aquatic_sites |> 
+  filter(field_site_subtype == 'Lake',
+         field_site_id != 'TOOK') |> 
+  pull(field_site_id)
+
+# Observations of Past Water Temp
+targets <- read_csv("https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz")
+
+# Filter the targets by focal sites
+targets <- targets %>%
+  filter(variable == "temperature",
+         site_id %in% focal_sites)
+
+
+# Stage 3: Past air temp 
+df_past <- neon4cast::noaa_stage3()
+
+noaa_past <- df_past |> 
+  dplyr::filter(
+                datetime >= ymd('2017-01-01'),
+                variable == "air_temperature",
+                site_id %in% focal_sites) |> 
+  dplyr::collect()
+
+# Aggregate Past Air Temp to Daily Mean Values
+weather_past_daily <- noaa_past |> 
+  mutate(datetime = as_date(datetime)) |> 
+  group_by(datetime, site_id, variable) |> 
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+  pivot_wider(names_from = variable, values_from = prediction) |> 
+  # convert air temp to C
+  mutate(air_temperature = air_temperature - 273.15) |>
+  group_by(site_id) |>
+  mutate(
+    airtemp_yday = slide_dbl(
+      air_temperature,
+      ~ mean(.x, na.rm = TRUE),
+      .before = 2,
+      .after = 0,
+      .complete = TRUE
+    )
+  )
+
+# Function  to  get SWOT WSE
+get_swot_wse <- function(site_ids=NULL,
+                         start_date = "2023-07-11", # Science Orbit
+                         end_date = Sys.Date()) {
+  
+  
+  
+  
+  site_ids <- toupper(site_ids)
+  
+  # Mapping between NEON site IDs and PLD lake IDs
+  PLD_add <- c(
+    BARC = 7320214782,
+    CRAM = 7250184002,
+    LIRO = 7421110232,
+    PRLA = 7420722382,
+    PRPO = 7420733062,
+    SUGG = 7320231232,
+    TOOK = 8130554202
+  )
+  
+  # If no site_ids provided, use all
+  if (missing(site_ids) || is.null(site_ids) || length(site_ids) == 0) {
+    site_ids <- names(PLD_add)
+    message("No site_ids provided. Using all sites: ", paste(site_ids, collapse = ", "))
+  } else {
+    site_ids <- toupper(site_ids)
+    
+    # Validate inputs
+    invalid_ids <- setdiff(site_ids, names(PLD_add))
+    if (length(invalid_ids) > 0) {
+      stop(
+        "Invalid site ID(s): ",
+        paste(invalid_ids, collapse = ", "),
+        ". Valid options are: ",
+        paste(names(PLD_add), collapse = ", ")
+      )
+    }
+  }
+  
+  # Build site lookup table only for requested sites
+  site_lookup <- tibble(
+    field_site_id = site_ids,
+    PLD_LakeID = unname(PLD_add[site_ids])
+  )
+  
+  collection_name <- "SWOT_L2_HR_LakeSP_D"
+  swot_vars <- "lake_id,time,wse,wse_u,quality_f,dark_frac,ice_clim_f,xtrk_dist,crid"
+  
+  base_time <- as.POSIXct("2000-01-01 00:00:00", tz = "UTC")
+  file_results <- list()
+  
+  for (i in seq_len(nrow(site_lookup))) {
+    
+    curr_site <- site_lookup$field_site_id[i]
+    pld_id <- site_lookup$PLD_LakeID[i]
+    
+    api_url <- paste0(
+      "https://soto.podaac.earthdatacloud.nasa.gov/hydrocron/v1/",
+      "timeseries?feature=PriorLake",
+      "&feature_id=", pld_id,
+      "&output=csv",
+      "&start_time=", start_date, "T00:00:00Z",
+      "&end_time=", as.character(end_date), "T23:59:59Z",
+      "&collection_name=", collection_name,
+      "&fields=", URLencode(swot_vars, reserved = TRUE)
+    )
+    
+    result <- tryCatch({
+      r <- GET(api_url, timeout(60))
+      stop_for_status(r)
+      
+      response <- fromJSON(content(r, as = "text", encoding = "UTF-8"))
+      
+      if (!is.null(response$error)) {
+        message("Error for site ", curr_site, ": ", response$error)
+        return(NULL)
+      }
+      
+      if (!is.null(response$status) &&
+          response$status == "200 OK" &&
+          !is.null(response$results$csv)) {
+        
+        csv_str <- response$results$csv
+        
+        if (!nzchar(trimws(csv_str))) {
+          message("No data returned for site ", curr_site)
+          return(NULL)
+        }
+        
+        df <- read_csv(I(csv_str), show_col_types = FALSE)
+        
+        if ("time" %in% names(df)) {
+          df <- df %>% filter(time >= 0)
+        }
+        
+        if (nrow(df) == 0) {
+          message("No valid rows for site ", curr_site)
+          return(NULL)
+        }
+        
+        unit_cols <- names(df)[grepl("units", names(df), ignore.case = TRUE)]
+        if (length(unit_cols) > 0) {
+          df <- df %>% select(-all_of(unit_cols))
+        }
+        
+        if ("time" %in% names(df)) {
+          df <- df %>%
+            mutate(time = base_time + time)
+        }
+        
+        df %>%
+          mutate(site_id = curr_site) %>%
+          rename(PLD_LakeID = lake_id, datetime = time) %>%
+          distinct()
+        
+        
+      } else {
+        message("Error Message for site ", curr_site)
+        NULL
+      }
+      
+    }, error = function(e) {
+      message("Failed to process site ", curr_site, ": ", e$message)
+      NULL
+    })
+    
+    if (!is.null(result)) {
+      file_results[[length(file_results) + 1]] <- result
+    }
+  }
+  
+  if (length(file_results) == 0) {
+    message("No valid data returned for requested site(s).")
+    return(NULL)
+  }
+  
+  bind_rows(file_results)
+}
+
+
+
+
+# For automated forecast, call WSE 
+WSE <- get_swot_wse()
+
+
+
+# Calculate SWOT baseline (mean of  WSE from 2023-2024) for anomaly calculation
+baseline_wse <- WSE %>%
+  mutate(datetime = as.Date(datetime)) %>%
+  filter(
+    site_id %in% focal_sites,
+    quality_f < 3,
+    datetime >= as.Date("2023-01-01"),
+    datetime <= as.Date("2024-12-31")
+  ) %>%
+  group_by(site_id) %>%
+  summarize(
+    wse_ref_mean = mean(wse, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Calculate anomaly
+WSE_filt <- WSE %>%
+  mutate(datetime = as.Date(datetime)) %>%
+  filter(site_id %in% focal_sites,
+         quality_f < 3) %>%
+  left_join(baseline_wse, by = "site_id") %>%
+  group_by(site_id) %>%
+  arrange(datetime, .by_group = TRUE) %>%
+  mutate(wse_anom = wse - wse_ref_mean) %>%
+  ungroup() %>%
+  filter(abs(wse_anom) < 2)
+
+
+# Examining anomaly through time for SWOT observations
+ggplot(WSE_filt, aes(x=datetime, y=wse_anom)) +
+  geom_line() +
+  facet_wrap(~ site_id) +
+  theme_minimal(base_size = 16)
+
+
+# Join past water temp with SWOT 
+targets_model_all <- targets |> 
+  pivot_wider(names_from = "variable", values_from = "observation") |> 
+  arrange(site_id, datetime) |>
+  left_join(weather_past_daily, by = c("datetime", "site_id")) |>
+  filter(datetime >= as_date("2023-07-01")) |>
+  drop_na(temperature, air_temperature, airtemp_yday) |> 
+  left_join(WSE_filt, by = c("datetime", "site_id"))
+
+
+# Number of SWOT horizon (observation from SWOT). Arbritary value of ~2 month. While maximum data gap can be calculated, what's the point of incorporating SWOT horizon beyond 2 month?
+forecast_date_count <- 60
+
+# We're interested in dates with SWOT observations then fill out 60 day SWOT horizon with temp. SWOT horizon 0 meaning SWOT observation available same day as temp
+targets_expanded <- targets_model_all %>%
+  filter(!is.na(wse_anom)) %>%   # only SWOT dates start forecasts
+  mutate(row_id = row_number()) %>%
+  rowwise() %>%
+  mutate(
+    block = list(
+      tibble(
+        site_id = site_id,
+        SWOT_date = datetime,
+        SWOT_horizon = 0:forecast_date_count,
+        datetime = datetime + lubridate::days(0:forecast_date_count),
+        wse_used = wse_anom,
+        wse_u_used = wse_u
+      ) %>%
+        left_join(
+          targets_model_all %>% 
+            select(-any_of(c(
+              "PLD_LakeID", "wse", "wse_anom", "wse_u", "quality_f",
+              "dark_frac", "ice_clim_f", "xtrk_dist", "crid", "wse_ref_mean"
+            ))),
+          by = c("site_id", "datetime")
+        )
+    )
+  ) %>%
+  ungroup() %>%
+  select(row_id, block) %>%
+  unnest(block) %>%
+  drop_na(temperature, air_temperature, airtemp_yday)
+
+
+# Create training data 
+df_model <- targets_expanded %>%
+  select(
+    row_id, site_id, SWOT_date, datetime, SWOT_horizon,
+    wse_used, temperature, air_temperature, airtemp_yday
+  ) %>%
+  mutate(SWOT_horizon = as.integer(SWOT_horizon))
+
+# For reforecast, we're going to train on data from year 2023, 2025, 2026  data then predict 2024. This is because 2025 had considerable decline in water level
+
+train_df <- df_model %>%
+  filter(
+    year(SWOT_date) %in% c(2023, 2025, 2026),
+    year(datetime) != 2024
+
+  )
+
+
+# test_df  datetime can go into 2025 (prediction) because it's not using actual observed air temp -> water temp
+test_df <- df_model %>%
+  filter(
+    year(SWOT_date) == 2024
+  )
+
+
+# Parallel setup
+n_cores <- parallel::detectCores() - 1
+cl <- makePSOCKcluster(max(1, n_cores))
+registerDoParallel(cl)
+
+
+# Function to tune + fit one SWOT horizon-specific model
+fit_one_horizon_rf <- function(dat, horizon_value) {
+  
+  dat_h <- dat %>%
+    filter(SWOT_horizon == horizon_value) %>%
+    select(-SWOT_horizon)
+  
+  # Skip tiny groups
+  if (nrow(dat_h) < 30) {
+    return(list(
+      SWOT_horizon = horizon_value,
+      status = "too_few_rows",
+      tune_res = NULL,
+      best_params = NULL,
+      workflow_final = NULL
+    ))
+  }
+  
+  # Random split with 5 folds
+  folds <- vfold_cv(dat_h, v = 5, strata=site_id)
+  
+  # Main model
+  rec <- recipe(temperature ~ wse_used + air_temperature + airtemp_yday, data = dat_h)
+  
+  rf_spec <- rand_forest(
+    mtry = tune(),
+    min_n = tune(),
+    trees = tune()
+  ) %>%
+    set_mode("regression") %>%
+    set_engine("ranger", importance = "permutation")
+  
+  wf <- workflow() %>%
+    add_recipe(rec) %>%
+    add_model(rf_spec)
+  
+  # Set of hyperparams to test
+  param_set <- extract_parameter_set_dials(wf) %>%
+    update(
+      mtry = mtry(range = c(1L, 3L)),
+      min_n = min_n(range = c(2L, 20L)),
+      trees = trees(c(300L, 500L))
+    )
+  
+  tune_res <- tune_grid(
+    wf,
+    resamples = folds,
+    grid = 20,
+    metrics = metric_set(rmse),
+    param_info = param_set,
+    control = control_grid(save_pred = TRUE)
+  )
+  
+  # RMSE as metric for choosing best hyperparameter
+  best_params <- select_best(tune_res, metric = "rmse")
+  
+  wf_final <- finalize_workflow(wf, best_params) %>%
+    fit(dat_h)
+  
+  list(
+    SWOT_horizon = horizon_value,
+    status = "ok",
+    tune_res = tune_res,
+    best_params = best_params,
+    workflow_final = wf_final
+  )
+}
+
+# Train one model per SWOT horizon
+SWOT_horizons <- sort(unique(train_df$SWOT_horizon))
+
+rf_by_horizon <- map(SWOT_horizons, ~ fit_one_horizon_rf(train_df, .x))
+names(rf_by_horizon) <- paste0("h", SWOT_horizons)
+
+# Stop cluster when done
+stopCluster(cl)
+registerDoSEQ()
+
+
+
+# Predict and calculate standard deivation to calculate process uncertanity later
+train_preds <- list()
+
+for (h in SWOT_horizons) {
+  
+  model_obj <- rf_by_horizon[[paste0("h", h)]]
+  
+  if (is.null(model_obj) || model_obj$status != "ok") next
+  
+  dat_h <- train_df %>%
+    filter(SWOT_horizon == h)
+  
+  rf_pred <- predict(model_obj$workflow_final, new_data = dat_h) %>%
+    pull(.pred)
+  
+  train_preds[[paste0("h", h)]] <- dat_h %>%
+    mutate(
+      prediction = rf_pred,
+      resid = temperature - prediction
+    )
+}
+
+train_preds_df <- bind_rows(train_preds)
+
+# 167 rows per SWOT horizon
+horizon_resid_sd <- train_preds_df %>%
+  group_by(SWOT_horizon) %>%
+  summarize(
+    resid_sd = sd(resid, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+
+ref_datetimes <- seq(as.Date("2024-01-01"), as.Date("2024-12-31"), by = "day")
+n_members <- 310
+
+
+all_site_forecasts <- list()
+
+for (i in seq_along(focal_sites)) {
+  
+  curr_site <- focal_sites[i]
+  site_forecasts <- list()
+  
+  site_target <- targets_expanded %>%
+    filter(site_id == curr_site) %>%
+    mutate(datetime = as.Date(datetime)) %>%
+    filter(!is.na(wse_used))
+  
+  for (rd in ref_datetimes) {
+    
+    reference_date <- as.Date(rd)
+    
+    # Latest available WSE/SWOT observation before forecast date
+    latest_wse <- site_target %>%
+      filter(SWOT_date <= reference_date) %>% # Equal to because we might want to forcast today (reference_datetime)
+      arrange(desc(SWOT_date)) %>%
+      slice(1)
+    
+    if (nrow(latest_wse) == 0) next
+    
+    
+    wse_date <- latest_wse$SWOT_date[1]
+    wse_value <- latest_wse$wse_used[1]
+    
+    # NOAA future ensemble forecast
+    df_future <- neon4cast::noaa_stage2(
+      start_date = as.character(reference_date))
+    
+    noaa_future <- df_future %>%
+      filter(
+        site_id == curr_site,
+        variable == "air_temperature"
+      ) %>%
+      collect()
+    
+    noaa_future_daily <- noaa_future %>%
+      mutate(
+        datetime = as.Date(datetime),
+        reference_datetime = as.Date(reference_datetime)
+      ) %>%
+      filter(
+        reference_datetime == reference_date, datetime > reference_date) 
+    
+    if (nrow(noaa_future_daily) == 0) next
+    
+    
+    noaa_future_daily <- noaa_future_daily %>% 
+      summarize(
+        prediction = mean(prediction, na.rm = TRUE),
+        .by = c(datetime, site_id, parameter, variable, reference_datetime)) %>%
+      pivot_wider(
+        names_from = variable,
+        values_from = prediction) %>%
+      mutate(
+        air_temperature = air_temperature - 273.15) %>%
+      select(datetime, site_id, air_temperature, parameter, reference_datetime)
+    
+    if (nrow(noaa_future_daily) == 0) next
+    
+    # Past observed/met air temp for lagged predictor, including reference_date's air temp (today's)
+    past_air <- weather_past_daily %>%
+      mutate(datetime = as.Date(datetime)) %>%
+      filter(
+        site_id == curr_site,
+        datetime >= reference_date - days(2),
+        datetime <= reference_date) %>%
+      select(datetime, site_id, air_temperature) %>%
+      crossing(noaa_future_daily %>% distinct(parameter)) %>%
+      mutate(reference_datetime = reference_date)
+    
+    if (nrow(past_air) == 0) next
+    
+    # Combine past + future air temp and calculate lag feature
+    air_for_lags <- bind_rows(
+      past_air,
+      noaa_future_daily %>%
+        select(datetime, site_id, air_temperature, parameter, reference_datetime)) %>%
+      arrange(parameter, datetime) %>%
+      group_by(parameter) %>%
+      mutate(
+        airtemp_yday = slide_dbl(
+          air_temperature,
+          ~ mean(.x, na.rm = TRUE),
+          .before = 2,
+          .after = 0,
+          .complete = TRUE
+        )
+      ) %>%
+      ungroup() %>%
+      filter(!is.na(airtemp_yday))
+    
+    forecasted_dates <- sort(unique(
+      air_for_lags$datetime[air_for_lags$datetime >= reference_date]
+    ))
+    
+    if (length(forecasted_dates) == 0) next
+    
+    # Predict water temp for each forecast date using SWOT horizon-specific RF model
+
+    rd_preds <- list()
+    
+    for (curr_date in forecasted_dates) {
+      
+      # Calculate SWOT horizon with current forecast date
+      swot_h <- as.integer(as.Date(curr_date) - as.Date(wse_date))
+      model_name <- paste0("h", swot_h)
+      
+      if (swot_h < 0 || !(model_name %in% names(rf_by_horizon))) next
+      
+      model_obj <- rf_by_horizon[[model_name]]
+      
+      if (is.null(model_obj) || model_obj$status != "ok") next
+      
+      # Prepare prediction df
+      pred_df <- air_for_lags %>%
+        filter(datetime == curr_date) %>%
+        mutate(
+          parameter = as.integer(parameter) + 1, # Add 1 to ensemble member to  match 
+          wse_used = wse_value,
+          SWOT_horizon = swot_h
+        ) %>%
+        select(
+          datetime,
+          reference_datetime,
+          site_id,
+          parameter,
+          SWOT_horizon,
+          wse_used,
+          air_temperature,
+          airtemp_yday
+        )
+      
+      # Expand to 310 ensemble members by cycling through each ensemble repeatedly and rename ensemble member
+      pred_df <- pred_df %>%
+        slice(rep(seq_len(n()), length.out = n_members)) %>%
+        mutate(parameter = row_number())
+      
+      if (nrow(pred_df) == 0) next
+      
+      #  Predict water temp
+      rf_pred <- predict(model_obj$workflow_final, new_data = pred_df) %>%
+        pull(.pred)
+      
+      # Add prediction 
+      pred_df <- pred_df %>%
+        mutate(prediction = rf_pred)
+      
+      # Pull standard deviation calculated for each SWOT-horizon
+      resid_sd_h <- horizon_resid_sd %>%
+        filter(SWOT_horizon == swot_h) %>%
+        pull(resid_sd)
+      
+      # Add process uncertainty
+      if (length(resid_sd_h) == 1 && !is.na(resid_sd_h) && resid_sd_h > 0) {
+        pred_df <- pred_df %>%
+          mutate(prediction = prediction + rnorm(n(), mean = 0, sd = resid_sd_h))
+      }
+      
+      # This is single forecast for a single reference datetime -> store in list
+      rd_preds[[as.character(curr_date)]] <- pred_df %>%
+        transmute(
+          site_id,
+          reference_datetime,
+          datetime,
+          SWOT_horizon,
+          parameter,
+          forecast_variable = "water_temperature",
+          prediction
+        )
+    }
+    
+    # Bind all the forecasts for a single reference datetime
+    site_forecasts[[as.character(reference_date)]] <- bind_rows(rd_preds)
+  }
+  # Bind all forecasts for all reference datetime for one site
+  all_site_forecasts[[curr_site]] <- bind_rows(site_forecasts)
+}
+# Bind all forecasts for all reference datetime for all site
+forecast_df <- bind_rows(all_site_forecasts)
+
+
+```
+
+#### Model Evaluation (NOT FORECAST) 
+
+```{r}
+
+# Evaluate SWOT lag 2 data
+
+model_h0 <- rf_by_horizon[["h2"]]$workflow_final
+
+test_h0 <- test_df %>%
+  filter(SWOT_horizon == 2)
+
+train_h0 <- train_df %>%
+  filter(SWOT_horizon == 2)
+
+
+pred_h0 <- predict(model_h0, new_data = test_h0) %>%
+  bind_cols(test_h0) %>%
+  rename(pred_temperature = .pred)
+
+eval_h0 <- pred_h0 %>%
+  metrics(
+    truth = temperature,
+    estimate = pred_temperature)
+
+eval_h0_extra <- pred_h0 %>%
+  summarize(
+    n = n(),
+    rmse = sqrt(mean((pred_temperature - temperature)^2, na.rm = TRUE)),
+    mae = mean(abs(pred_temperature - temperature), na.rm = TRUE),
+    bias = mean(pred_temperature - temperature, na.rm = TRUE),
+    r2 = cor(pred_temperature, temperature, use = "complete.obs")^2)
+
+ggplot(pred_h0, aes(x = temperature, y = pred_temperature)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Observed vs Predicted Temperature with SWOT Data From 2 Days Ago",
+    x = "Observed temperature",
+    y = "Predicted temperature"
+  ) +
+  theme_bw()
+
+
+```
+
+Random forest model for SWOT lag 2 suggest that the model is doing a decent job predicting temperature, although there might be trends of overestimating colder water. This reflect lack of data collected in the winter in preparation of ice.
+
+```{r}
+# Extract fitted ranger object from workflow
+rf_fit_h0 <- extract_fit_parsnip(model_h0)$fit
+
+
+pred_wrapper_ranger <- function(object, newdata) {
+  predict(object, data = newdata)$predictions
+}
+
+test_h0_small <- test_h0 %>%
+  select(temperature, wse_used, air_temperature, airtemp_yday)
+
+set.seed(123)
+
+vip::vip(
+  model_h0,
+  method = "permute",
+  target = "temperature",
+  metric = "rmse",
+  train = test_h0_small,
+  pred_wrapper = pred_wrapper_ranger,
+  num_features = 10
+  )
+```
+
+```{r}
+
+x_train_h0 <- train_h0 %>%
+  select(wse_used, air_temperature, airtemp_yday) %>%
+  as.data.frame()
+
+x_test_h0 <- test_h0 %>%
+  select(wse_used, air_temperature, airtemp_yday) %>%
+  as.data.frame()
+
+pred_wrapper <- function(object, newdata) {
+  predict(object, new_data = newdata)$.pred
+}
+
+shap_h0 <- fastshap::explain(
+  object = model_h0,
+  X = x_train_h0,
+  newdata = x_test_h0,
+  pred_wrapper = pred_wrapper,
+  nsim = 100)
+
+shap_h0_df <- shap_h0 %>%
+  as_tibble() %>%
+  mutate(row_id = test_h0$row_id)
+
+shap_h0_df
+
+
+sv <- shapviz(
+  shap_h0,            
+  X = x_test_h0)
+
+sv_importance(sv, kind = "beeswarm")
+```
+
+Model importance suggests that air temperature lag is the most important predictor, reflecting the thermal inertia of water and the similar coupling of drivers that drive air temperature and water temperature. Unfortunately, SWOT WSE doesn't seem to be an important variable. This is similarly reflected in the SHAP beeswarm chart where strong driving patterns aren't evident with SWOT's WSE.
+
+```{r}
+pred_all_2024 <- map_dfr(rf_by_horizon, function(mod) {
+  h <- mod$SWOT_horizon
+  
+  test_h <- test_df %>%
+    filter(SWOT_horizon == h)
+  
+  if (is.null(mod$workflow_final) || nrow(test_h) == 0) return(NULL)
+  
+  predict(mod$workflow_final, new_data = test_h) %>%
+    bind_cols(test_h) %>%
+    rename(pred_temperature = .pred)
+}) %>%
+  filter(year(datetime) == 2024)
+
+
+rmse_by_swot_horizon <- pred_all_2024 %>%
+  group_by(SWOT_horizon) %>%
+  summarize(
+    n = n(),
+    rmse = sqrt(mean((pred_temperature - temperature)^2, na.rm = TRUE)),
+    .groups = "drop")
+
+ggplot(rmse_by_swot_horizon, aes(x = SWOT_horizon, y = rmse)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "2024 RMSE by SWOT Horizon",
+    x = "SWOT Lag (days since SWOT observation)",
+    y = "RMSE (°C)") +
+  theme_bw()
+```
+
+Examining performance by SWOT lag across sites, it seems as though there isn't a clear trend in performance across SWOT lag. This is contrary to my expectation and is likely because, as mentioned above, SWOT's WSE isn't an important variable for water temperature prediction.
+
+#### Reforecast Evaluation
+
+```{r}
+all_results <- open_dataset("s3://bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature", 
+                            s3_endpoint = "sdsc.osn.xsede.org", 
+                            anonymous = TRUE)
+my_forecasts <- all_results |> 
+  filter(
+    site_id %in% focal_sites,
+    model_id %in% c("climatology", "persistenceRW"),
+    reference_datetime >= as_date("2024-01-01"),
+    reference_datetime < as_date("2025-01-01"),
+    ) |> 
+  collect()
+
+forecast_dates = unique(my_forecasts$datetime)
+
+obs <- read_csv("https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz") %>%
+  filter(site_id %in% focal_sites,
+         variable == "temperature",
+         datetime >= as_date("2024-01-01"),
+         datetime < as_date("2025-03-01"))
+
+
+multi_forecast_parametric <- my_forecasts |> 
+  filter(model_id == "climatology") |>
+  left_join(obs, by = c("datetime", "site_id", "variable")) |> 
+  mutate(horizon = as.numeric(datetime - reference_datetime, units="days"))|>
+  select(model_id, datetime, reference_datetime, prediction, observation, parameter, horizon, site_id) |>
+  arrange(datetime)|>
+  pivot_wider(
+    names_from = parameter,
+    values_from = prediction,
+    values_fn = mean
+  ) |>
+  drop_na(observation)
+
+
+multi_forecast_ensemble <- my_forecasts |> 
+  filter(model_id == "persistenceRW") |> 
+  left_join(obs, by = c("datetime", "site_id", "variable")) |> 
+  mutate(horizon = as.numeric(datetime - reference_datetime, units="days"))|>
+  select(model_id, datetime, reference_datetime, prediction, observation, parameter, horizon, site_id) |>
+  arrange(datetime)|>
+  drop_na(observation)
+
+
+multi_forecast_ensemble2 <- forecast_df |> 
+  mutate(model_id = "WSE_Temp_RF") |> 
+  left_join(obs, by = c("datetime", "site_id")) |> 
+  select(reference_datetime, model_id, datetime, prediction, observation, parameter, SWOT_horizon, site_id) |>
+  mutate(
+    datetime = as.Date(datetime),
+    reference_datetime = as.Date(reference_datetime),
+    horizon = as.numeric(datetime - reference_datetime, units = "days"))|>
+  arrange(reference_datetime, datetime, parameter)|>
+  drop_na(observation)
+
+
+normal_crps <- multi_forecast_parametric |> 
+  group_by(datetime, reference_datetime, model_id, horizon, site_id) |> 
+  summarize(crps = crps_norm(observation, mean = mu, sd = sigma)) |>
+  filter(!is.na(crps))
+
+
+
+crps_tidy_ensemble <- function(prediction, observation) {
+  obs <- observation[1] #all the observations are the same for each row, but we only need one
+  crps_sample(obs, prediction)
+}
+
+ensemble_crps <- multi_forecast_ensemble |> 
+  filter(!is.na(observation), !is.na(prediction)) |> 
+  group_by(datetime, reference_datetime, model_id, horizon, site_id) |> 
+  summarize(crps = crps_tidy_ensemble(prediction, observation)) 
+
+
+ensemble_crps2 <- multi_forecast_ensemble2 |> 
+  filter(!is.na(observation), !is.na(prediction)) |> 
+  filter(!horizon == -1) |>
+  group_by(reference_datetime, datetime, model_id, horizon, site_id) |> 
+  summarize(crps = crps_tidy_ensemble(prediction, observation))  |>
+  arrange(reference_datetime, horizon)
+
+
+crps_all <- bind_rows(
+  normal_crps,
+  ensemble_crps,
+  ensemble_crps2) %>%
+  group_by(site_id, datetime, reference_datetime) %>%
+  filter(n_distinct(model_id) == 3) %>%
+  ungroup()
+
+```
+
+```{r}
+
+crps_by_horizon <- crps_all |>
+  group_by(model_id, horizon) |>
+  summarize(
+    mean_crps = mean(crps, na.rm = TRUE),
+    .groups = "drop" ) 
+
+ggplot(crps_by_horizon, aes(x = horizon, y = mean_crps, color = model_id)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Horizon",
+    y = "Mean CRPS",
+    color = "Model") 
+```
+
+When examining overall model performance over forecast horizon, our model performs worse than persistence and climatology at short horizons. Our model then performs better than persistence at higher horizons starting at 7 but still underperforms relative to climatology. This highlights the strengths of each model. Water temperature is slow to change whicih reflects on the persistence model in its low horizons, although eventually acting forces make such model irrelevant. Climatology reflects the general seasonality of drivers of water temperature and how that translates to long term averages being good indicators of water temperature. This compares to my model which relies mainly on air temperature to predict water temperature. While air temperature and water temperature are controlled by similar processes (solar radiation), water temmperature is also controlled by other processes such as inflow and outflow temperatures or heat inertia. These processes are poorly represented by SWOT WSE in my model while climatology indirectly represent these processes since these other controls are also seasonal. In addition, this could also reflect the problem of data shortage as persistence depends on simply yesterday's temperature while climatology takes years of data while my model only uses max 3 years of data at around 21 temporal resolution due to the limited temporal scope of SWOT.
+
+```{r}
+crps_by_rd = crps_all %>%
+  group_by(reference_datetime, model_id, site_id) |>
+  summarize(
+    mean_crps = mean(crps, na.rm=TRUE),
+    .groups = "drop")
+
+
+ggplot(crps_by_rd, aes(x = reference_datetime, y = mean_crps, color = model_id)) +
+  geom_line() +
+  facet_wrap(~ site_id, scales = "free_y", ncol = 2) +
+  labs(
+    x = "Reference Date",
+    y = "Mean CRPS",
+    color = "Model"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Add observed water temp to CRPS results
+crps_env <- crps_all %>%
+  left_join(
+    obs %>%
+      select(site_id, datetime, water_temp = observation),
+    by = c("site_id", "datetime"))
+
+crps_by_wtemp <- crps_env %>%
+  mutate(
+    water_temp_bin = cut(
+      water_temp,
+      breaks = seq(
+        floor(min(water_temp, na.rm = TRUE)),
+        ceiling(max(water_temp, na.rm = TRUE)),
+        by = 2
+      ),
+      include.lowest = TRUE
+    )) %>%
+  group_by(model_id, water_temp_bin) %>%
+  summarize(
+    mean_crps = mean(crps, na.rm = TRUE),
+    n = n(),
+    .groups = "drop")
+
+ggplot(crps_by_wtemp,
+       aes(water_temp_bin, mean_crps, color = model_id, group = model_id)) +
+  geom_line() +
+  labs(
+    x = "Observed water temperature bin (°C)",
+    y = "Mean CRPS",
+    color = "Model") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+When examining model performance over season and over water temperature, it seems as though my model tends to perform worse over the shoulder seasons and over colder temperature. This again reflects the various controls of water that is poorly reflected in WSE. For example, stratification turnovers that occur in these transition seasons would affect water temperature across the entire column by mixing deep water temperature with surface water temperature. While climatology might reflect that timing since lakes are likely to experience those on similar times (wind and temperature seasonality), WSE poorly represent these timings. Issues over colder temperatures again reflect the lack of data in the colder seasons in preparation of freeze-up.
+
+### PART 3.
+
+Model ID: SWOT_AirTemp_RF
+
+Github repository link: <https://github.com/sunwooy/NEON_forecast_challenge_SWOT_Temp>\\
+
+Forecast Generation Code: <https://github.com/sunwooy/NEON_forecast_challenge_SWOT_Temp/tree/main/Submit_forecast>
+
+Quarto Report: <https://github.com/sunwooy/NEON_forecast_challenge_SWOT_Temp/tree/main/Submit_forecast>
+
+Evident of multiple automated forecasts
