@@ -982,6 +982,6 @@ Github repository link: <https://github.com/sunwooy/NEON_forecast_challenge_SWOT
 
 Forecast Generation Code: <https://github.com/sunwooy/NEON_forecast_challenge_SWOT_Temp/tree/main/Submit_forecast>
 
-Quarto Report: <https://github.com/sunwooy/NEON_forecast_challenge_SWOT_Temp/tree/main/Reforecast/Reforecast.html>/
+Quarto Report: <https://github.com/sunwooy/NEON_forecast_challenge_SWOT_Temp/blob/main/Reforecast/Reforecast.qmd>
 
 Evidence of multiple automated forecasts: <https://github.com/sunwooy/NEON_forecast_challenge_SWOT_Temp/blob/main/Reforecast/Evidence_Auto_Submission.png>
